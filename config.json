@@ -1,0 +1,22 @@
+{
+    "headless": false,
+
+    "accounts": [
+        {
+            "name": "Edge账号",
+            "browser": "edge",
+            "enabled": true
+        },
+        {
+            "name": "Chrome账号",
+            "browser": "chrome",
+            "enabled": true
+        }
+    ],
+
+    "claim": {
+        "timeout": 30000,
+        "retry": 3,
+        "wait_after_click": 2500
+    }
+}
