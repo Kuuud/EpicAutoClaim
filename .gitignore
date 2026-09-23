@@ -1,0 +1,6 @@
+# 忽略 IntelliJ IDEA / WebStorm 等 JetBrains IDE 的配置目录
+.idea/
+
+# 忽略日志目录（匹配任意层级的 logs 文件夹）
+logs/
+

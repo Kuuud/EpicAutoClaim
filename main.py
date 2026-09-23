@@ -1,1244 +1,370 @@
-import json
-import logging
-import os
-import re
-import sys
-import time
-import traceback
+
+import json, logging, os, re, sys, time, threading, traceback
 from datetime import datetime
 from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox
 
-from playwright.sync_api import (
-    sync_playwright,
-    TimeoutError as PlaywrightTimeoutError
-)
-
-
-# ============================================================
-# 路径
-# ============================================================
+from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).resolve().parent
-
 CONFIG_FILE = BASE_DIR / "config.json"
 PROFILE_DIR = BASE_DIR / "profiles"
 LOG_DIR = BASE_DIR / "logs"
 SCREENSHOT_DIR = BASE_DIR / "screenshots"
-
-PROFILE_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-SCREENSHOT_DIR.mkdir(exist_ok=True)
-
-
-# ============================================================
-# 日志
-# ============================================================
-
-log_file = LOG_DIR / f"{datetime.now():%Y-%m-%d}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(
-            log_file,
-            encoding="utf-8"
-        ),
-        logging.StreamHandler()
-    ]
-)
-
-logger = logging.getLogger("EpicAutoClaim")
-
-
-# ============================================================
-# 配置
-# ============================================================
+for p in (PROFILE_DIR, LOG_DIR, SCREENSHOT_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
 def load_config():
     if not CONFIG_FILE.exists():
-        logger.error("找不到 config.json")
-        sys.exit(1)
-
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+        cfg = {
+            "headless": False,
+            "accounts": [
+                {"name":"Edge账号","browser":"edge","enabled":True},
+                {"name":"Chrome账号","browser":"chrome","enabled":True}
+            ],
+            "schedule":{"enabled":True,"day":"THU","time":"18:00"},
+            "claim":{"timeout":30000,"retry":3,"wait_after_click":2500}
+        }
+        CONFIG_FILE.write_text(json.dumps(cfg,ensure_ascii=False,indent=4),encoding="utf-8")
+        return cfg
+    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
 CONFIG = load_config()
 
-TIMEOUT = CONFIG.get(
-    "claim",
-    {}
-).get(
-    "timeout",
-    30000
-)
+class GuiLogHandler(logging.Handler):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+    def emit(self, record):
+        msg = self.format(record)
+        self.app.after(0, self.app.append_log, msg)
 
-RETRY = CONFIG.get(
-    "claim",
-    {}
-).get(
-    "retry",
-    3
-)
+logger = logging.getLogger("EpicAutoClaim")
+logger.setLevel(logging.INFO)
+file_handler = logging.FileHandler(LOG_DIR/f"{datetime.now():%Y-%m-%d}.log", encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(file_handler)
 
-WAIT_AFTER_CLICK = CONFIG.get(
-    "claim",
-    {}
-).get(
-    "wait_after_click",
-    2500
-)
+EPIC_FREE_GAMES = "https://store.epicgames.com/en-US/free-games"
+TIMEOUT = 30000
 
-
-# ============================================================
-# Epic
-# ============================================================
-
-EPIC_STORE = "https://store.epicgames.com/"
-
-EPIC_FREE_GAMES = (
-    "https://store.epicgames.com/en-US/free-games"
-)
-
-
-# ============================================================
-# 浏览器
-# ============================================================
-
-def get_browser_executable(browser_name):
-
-    if browser_name.lower() == "edge":
+def browser_executable(browser):
+    if browser == "edge":
         candidates = [
-            os.environ.get(
-                "PROGRAMFILES(X86)",
-                r"C:\Program Files (x86)"
-            )
-            + r"\Microsoft\Edge\Application\msedge.exe",
-
-            os.environ.get(
-                "PROGRAMFILES",
-                r"C:\Program Files"
-            )
-            + r"\Microsoft\Edge\Application\msedge.exe"
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%PROGRAMFILES%\Microsoft\Edge\Application\msedge.exe"),
         ]
-
-    elif browser_name.lower() == "chrome":
-        candidates = [
-            os.environ.get(
-                "PROGRAMFILES",
-                r"C:\Program Files"
-            )
-            + r"\Google\Chrome\Application\chrome.exe",
-
-            os.environ.get(
-                "PROGRAMFILES(X86)",
-                r"C:\Program Files (x86)"
-            )
-            + r"\Google\Chrome\Application\chrome.exe",
-
-            os.path.expandvars(
-                r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-            )
-        ]
-
     else:
-        raise RuntimeError(
-            f"未知浏览器：{browser_name}"
-        )
+        candidates = [
+            os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+    for p in candidates:
+        if p and Path(p).exists():
+            return p
+    return None
 
-    for path in candidates:
-        if path and Path(path).exists():
-            return path
-
-    raise RuntimeError(
-        f"没有找到 {browser_name} 浏览器"
-    )
-
-
-def create_profile(browser_name):
-
-    path = PROFILE_DIR / browser_name.lower()
-    path.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    return str(path)
-
-
-# ============================================================
-# 截图
-# ============================================================
-
-def screenshot(page, account_name, suffix):
-
-    safe_name = re.sub(
-        r'[\\/:*?"<>| ]+',
-        "_",
-        account_name
-    )
-
-    filename = (
-        f"{datetime.now():%Y%m%d_%H%M%S}_"
-        f"{safe_name}_{suffix}.png"
-    )
-
-    path = SCREENSHOT_DIR / filename
-
+def screenshot(page, name, suffix):
+    safe = re.sub(r'[\\/:*?"<>| ]+', "_", name)
+    path = SCREENSHOT_DIR/f"{datetime.now():%Y%m%d_%H%M%S}_{safe}_{suffix}.png"
     try:
-        page.screenshot(
-            path=str(path),
-            full_page=True
-        )
-
-        logger.info(
-            "截图：%s",
-            path
-        )
-
-    except Exception as e:
-        logger.warning(
-            "截图失败：%s",
-            e
-        )
-
-
-# ============================================================
-# 页面等待
-# ============================================================
-
-def wait_page(page, seconds=2):
-
-    try:
-        page.wait_for_load_state(
-            "domcontentloaded",
-            timeout=TIMEOUT
-        )
+        page.screenshot(path=str(path), full_page=True)
+        logger.info("[%s] 截图：%s", name, path)
     except Exception:
         pass
 
-    time.sleep(seconds)
-
-
-# ============================================================
-# 登录检查
-# ============================================================
-
-def is_login_page(page):
-
-    url = page.url.lower()
-
-    login_keywords = [
-        "login",
-        "id/login",
-        "signin",
-        "account/signin"
-    ]
-
-    return any(
-        keyword in url
-        for keyword in login_keywords
-    )
-
-
-def wait_for_manual_login(
-    page,
-    account_name
-):
-
-    logger.warning(
-        "[%s] 需要登录 Epic。",
-        account_name
-    )
-
-    print()
-    print("=" * 70)
-    print(f"{account_name} 需要登录 Epic")
-    print("请在打开的浏览器窗口中完成登录。")
-    print("如果出现验证码/二次验证，请人工完成。")
-    print("完成后程序会自动继续。")
-    print("=" * 70)
-    print()
-
-    start = time.time()
-
-    while time.time() - start < 300:
-
-        try:
-
-            url = page.url.lower()
-
-            if (
-                "login" not in url
-                and "signin" not in url
-            ):
-
-                # 再给页面一点时间
-                time.sleep(3)
-
-                logger.info(
-                    "[%s] 检测到登录流程结束。",
-                    account_name
-                )
-
-                return True
-
-        except Exception:
-            pass
-
-        time.sleep(2)
-
-    return False
-
-
-def ensure_login(
-    page,
-    account_name
-):
-
-    page.goto(
-        EPIC_STORE,
-        wait_until="domcontentloaded",
-        timeout=TIMEOUT
-    )
-
-    wait_page(page, 3)
-
-    if is_login_page(page):
-
-        return wait_for_manual_login(
-            page,
-            account_name
-        )
-
-    # 页面上检查登录按钮
-    login_texts = [
-        "Sign In",
-        "登录",
-        "SIGN IN"
-    ]
-
-    for text in login_texts:
-
-        try:
-
-            locator = page.get_by_text(
-                text,
-                exact=True
-            )
-
-            if locator.count() > 0:
-
-                logger.info(
-                    "[%s] 可能尚未登录。",
-                    account_name
-                )
-
-                return wait_for_manual_login(
-                    page,
-                    account_name
-                )
-
-        except Exception:
-            pass
-
-    logger.info(
-        "[%s] 当前看起来已经登录。",
-        account_name
-    )
-
-    return True
-
-
-# ============================================================
-# 获取免费游戏页面
-# ============================================================
-
-def open_free_games(page):
-
-    logger.info(
-        "打开 Epic 免费游戏页面..."
-    )
-
-    page.goto(
-        EPIC_FREE_GAMES,
-        wait_until="domcontentloaded",
-        timeout=TIMEOUT
-    )
-
-    wait_page(page, 4)
-
-    return page
-
-
-# ============================================================
-# CAPTCHA / 验证检测
-# ============================================================
-
-def detect_verification(page):
-
-    content = ""
-
+def body_text(page):
     try:
-        content = page.locator(
-            "body"
-        ).inner_text(
-            timeout=5000
-        ).lower()
+        return page.locator("body").inner_text(timeout=5000).lower()
     except Exception:
-        return False
+        return ""
 
-    keywords = [
-        "captcha",
-        "verify you are human",
-        "验证您是人类",
-        "安全验证",
-        "robot",
-        "机器人",
-        "two-factor",
-        "two factor",
-        "二步验证"
-    ]
+def verification_needed(page):
+    text = body_text(page)
+    return any(x in text for x in [
+        "captcha", "verify you are human", "安全验证", "验证码",
+        "two-factor", "two factor", "二步验证"
+    ])
 
-    for keyword in keywords:
+def owned(page):
+    text = body_text(page)
+    return any(x in text for x in [
+        "in library", "owned", "已在库中", "已拥有", "已领取"
+    ])
 
-        if keyword.lower() in content:
-
-            logger.warning(
-                "检测到可能需要人工验证：%s",
-                keyword
-            )
-
-            return True
-
-    return False
-
-
-# ============================================================
-# 获取按钮
-# ============================================================
-
-def get_button_candidates(page):
-
-    selectors = [
-
-        # 英文
-        'button:has-text("Get")',
-        'button:has-text("GET")',
-        'button:has-text("Claim")',
-        'button:has-text("CLAIM")',
-
-        # 中文
-        'button:has-text("获取")',
-        'button:has-text("领取")',
-
-        # 通用
-        '[role="button"]:has-text("Get")',
-        '[role="button"]:has-text("获取")',
-        '[role="button"]:has-text("领取")',
-
-        'a:has-text("Get")',
-        'a:has-text("获取")',
-        'a:has-text("领取")'
-    ]
-
-    return selectors
-
-
-def click_first_valid(
-    page,
-    selectors
-):
-
-    for selector in selectors:
-
+def click_candidates(page, candidates):
+    for selector in candidates:
         try:
-
-            locator = page.locator(
-                selector
-            )
-
-            count = locator.count()
-
-            if count == 0:
-                continue
-
-            for i in range(
-                min(count, 10)
-            ):
-
-                item = locator.nth(i)
-
-                try:
-
-                    if not item.is_visible():
-                        continue
-
-                    if not item.is_enabled():
-                        continue
-
-                    logger.info(
-                        "尝试点击：%s",
-                        selector
-                    )
-
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 10)):
+                item = loc.nth(i)
+                if item.is_visible() and item.is_enabled():
                     item.scroll_into_view_if_needed()
-
-                    time.sleep(0.5)
-
-                    item.click(
-                        timeout=5000
-                    )
-
+                    item.click(timeout=5000)
                     return True
-
-                except Exception:
-                    continue
-
         except Exception:
             continue
-
     return False
 
-
-# ============================================================
-# 判断已经领取
-# ============================================================
-
-def is_already_owned(page):
-
-    try:
-
-        body = page.locator(
-            "body"
-        ).inner_text(
-            timeout=5000
-        ).lower()
-
-    except Exception:
-        return False
-
-    owned_keywords = [
-        "in library",
-        "owned",
-        "已在库中",
-        "已拥有",
-        "已领取",
-        "library"
-    ]
-
-    for keyword in owned_keywords:
-
-        if keyword.lower() in body:
-
-            logger.info(
-                "检测到游戏可能已经在库中：%s",
-                keyword
-            )
-
-            return True
-
-    return False
-
-
-# ============================================================
-# 订单确认
-# ============================================================
-
-def confirm_order(page):
-
-    logger.info(
-        "检查订单确认页面..."
-    )
-
-    time.sleep(
-        WAIT_AFTER_CLICK / 1000
-    )
-
-    # 常见的免费订单确认按钮
-    selectors = [
-
-        'button:has-text("Place Order")',
-        'button:has-text("Place order")',
-        'button:has-text("Complete Purchase")',
-
-        'button:has-text("确认订单")',
-        'button:has-text("下单")',
-        'button:has-text("完成购买")',
-
-        '[role="button"]:has-text("Place Order")',
-        '[role="button"]:has-text("确认订单")'
-    ]
-
-    clicked = click_first_valid(
-        page,
-        selectors
-    )
-
-    if clicked:
-
-        logger.info(
-            "已点击订单确认按钮。"
+def ensure_login(page, account_name):
+    page.goto("https://store.epicgames.com/", wait_until="domcontentloaded", timeout=TIMEOUT)
+    time.sleep(3)
+    url = page.url.lower()
+    text = body_text(page)
+    if "login" in url or "signin" in url or "sign in" in text:
+        logger.warning("[%s] 需要登录，请在浏览器中完成登录。", account_name)
+        messagebox.showinfo(
+            "需要登录",
+            f"{account_name} 尚未登录。\n\n请在弹出的浏览器中完成 Epic 登录、验证码或 2FA，然后点击确定继续。"
         )
-
-        time.sleep(4)
-
-        return True
-
-    return False
-
-
-# ============================================================
-# 领取当前页面游戏
-# ============================================================
-
-def claim_current_game(
-    page,
-    account_name
-):
-
-    if detect_verification(page):
-
-        screenshot(
-            page,
-            account_name,
-            "verification"
-        )
-
-        logger.warning(
-            "[%s] 页面需要人工验证。",
-            account_name
-        )
-
-        input(
-            f"\n[{account_name}] "
-            "请在浏览器中完成验证，然后按 Enter 继续..."
-        )
-
-    if is_already_owned(page):
-
-        logger.info(
-            "[%s] 当前游戏已经领取，跳过。",
-            account_name
-        )
-
-        return True
-
-    selectors = get_button_candidates(
-        page
-    )
-
-    if not click_first_valid(
-        page,
-        selectors
-    ):
-
-        logger.warning(
-            "[%s] 没有找到获取/领取按钮。",
-            account_name
-        )
-
-        screenshot(
-            page,
-            account_name,
-            "no_get_button"
-        )
-
-        return False
-
-    logger.info(
-        "[%s] 已点击获取按钮。",
-        account_name
-    )
-
-    time.sleep(
-        WAIT_AFTER_CLICK / 1000
-    )
-
-    # 尝试确认订单
-    confirm_order(page)
-
-    time.sleep(4)
-
-    if is_already_owned(page):
-
-        logger.info(
-            "[%s] 领取成功/游戏已经在库中。",
-            account_name
-        )
-
-        return True
-
-    # 再检查页面文字
-    try:
-
-        text = page.locator(
-            "body"
-        ).inner_text(
-            timeout=5000
-        ).lower()
-
-        success_keywords = [
-            "thank you",
-            "thanks for your purchase",
-            "in library",
-            "owned",
-            "已在库中",
-            "已拥有",
-            "已领取",
-            "谢谢"
-        ]
-
-        for keyword in success_keywords:
-
-            if keyword in text:
-
-                logger.info(
-                    "[%s] 检测到领取成功标志：%s",
-                    account_name,
-                    keyword
-                )
-
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            url = page.url.lower()
+            if "login" not in url and "signin" not in url:
+                time.sleep(3)
                 return True
-
-    except Exception:
-        pass
-
-    return False
-
-
-# ============================================================
-# 查找免费游戏
-# ============================================================
-
-def find_free_game_links(page):
-
-    logger.info(
-        "分析免费游戏页面..."
-    )
-
-    links = []
-
-    try:
-
-        anchors = page.locator(
-            "a[href]"
-        )
-
-        count = anchors.count()
-
-        logger.info(
-            "页面发现 %d 个链接。",
-            count
-        )
-
-        for i in range(
-            min(count, 500)
-        ):
-
-            try:
-
-                a = anchors.nth(i)
-
-                href = a.get_attribute(
-                    "href"
-                )
-
-                if not href:
-                    continue
-
-                href_lower = href.lower()
-
-                if (
-                    "/p/" in href_lower
-                    or "/game/" in href_lower
-                ):
-
-                    if href.startswith("/"):
-                        href = (
-                            "https://store.epicgames.com"
-                            + href
-                        )
-
-                    if href not in links:
-
-                        links.append(href)
-
-            except Exception:
-                continue
-
-    except Exception as e:
-
-        logger.error(
-            "分析免费游戏失败：%s",
-            e
-        )
-
-    return links
-
-
-# ============================================================
-# 领取账号
-# ============================================================
-
-def run_account(
-    account,
-    playwright
-):
-
-    account_name = account["name"]
-    browser_name = account["browser"]
-
-    logger.info(
-        ""
-    )
-
-    logger.info(
-        "=" * 70
-    )
-
-    logger.info(
-        "开始处理：%s",
-        account_name
-    )
-
-    logger.info(
-        "浏览器：%s",
-        browser_name
-    )
-
-    logger.info(
-        "=" * 70
-    )
-
-    executable = get_browser_executable(
-        browser_name
-    )
-
-    profile = create_profile(
-        browser_name
-    )
-
-    logger.info(
-        "浏览器：%s",
-        executable
-    )
-
-    logger.info(
-        "Profile：%s",
-        profile
-    )
-
-    context = None
-
-    try:
-
-        context = playwright.chromium.launch_persistent_context(
-
-            user_data_dir=profile,
-
-            executable_path=executable,
-
-            headless=CONFIG.get(
-                "headless",
-                False
-            ),
-
-            viewport={
-                "width": 1440,
-                "height": 900
-            },
-
-            locale="zh-CN",
-
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-notifications"
-            ]
-        )
-
-        if len(context.pages) > 0:
-            page = context.pages[0]
-        else:
-            page = context.new_page()
-
-        page.set_default_timeout(
-            TIMEOUT
-        )
-
-        # ----------------------------------------------------
-        # 登录
-        # ----------------------------------------------------
-
-        if not ensure_login(
-            page,
-            account_name
-        ):
-
-            logger.error(
-                "[%s] 登录失败。",
-                account_name
-            )
-
-            screenshot(
-                page,
-                account_name,
-                "login_failed"
-            )
-
-            return False
-
-        # ----------------------------------------------------
-        # 免费游戏页面
-        # ----------------------------------------------------
-
-        open_free_games(
-            page
-        )
-
-        # ----------------------------------------------------
-        # CAPTCHA
-        # ----------------------------------------------------
-
-        if detect_verification(
-            page
-        ):
-
-            screenshot(
-                page,
-                account_name,
-                "verification"
-            )
-
-            input(
-                f"\n[{account_name}] "
-                "检测到人工验证，请完成后按 Enter..."
-            )
-
-        # ----------------------------------------------------
-        # 找游戏
-        # ----------------------------------------------------
-
-        links = find_free_game_links(
-            page
-        )
-
-        logger.info(
-            "[%s] 找到 %d 个可能的游戏链接。",
-            account_name,
-            len(links)
-        )
-
-        if not links:
-
-            logger.warning(
-                "[%s] 没有找到游戏链接。",
-                account_name
-            )
-
-            screenshot(
-                page,
-                account_name,
-                "no_games"
-            )
-
-            return False
-
-        # ----------------------------------------------------
-        # 逐个尝试
-        #
-        # Epic 免费页面通常同时存在：
-        # 本周免费
-        # 下周预告
-        # DLC
-        #
-        # 所以这里只尝试前几个候选。
-        # ----------------------------------------------------
-
-        processed = 0
-
-        for link in links:
-
-            if processed >= 6:
-                break
-
-            processed += 1
-
-            logger.info(
-                "[%s] 打开候选游戏：%s",
-                account_name,
-                link
-            )
-
-            try:
-
-                page.goto(
-                    link,
-                    wait_until="domcontentloaded",
-                    timeout=TIMEOUT
-                )
-
-                wait_page(
-                    page,
-                    3
-                )
-
-                if detect_verification(
-                    page
-                ):
-
-                    screenshot(
-                        page,
-                        account_name,
-                        "verification_game"
-                    )
-
-                    input(
-                        f"\n[{account_name}] "
-                        "请完成验证后按 Enter..."
-                    )
-
-                # 已拥有
-                if is_already_owned(
-                    page
-                ):
-
-                    logger.info(
-                        "[%s] 游戏已拥有，跳过。",
-                        account_name
-                    )
-
-                    continue
-
-                # 尝试领取
-                success = False
-
-                for retry in range(
-                    1,
-                    RETRY + 1
-                ):
-
-                    logger.info(
-                        "[%s] 第 %d/%d 次领取尝试。",
-                        account_name,
-                        retry,
-                        RETRY
-                    )
-
-                    try:
-
-                        success = claim_current_game(
-                            page,
-                            account_name
-                        )
-
-                        if success:
-                            break
-
-                    except Exception as e:
-
-                        logger.warning(
-                            "领取异常：%s",
-                            e
-                        )
-
-                        screenshot(
-                            page,
-                            account_name,
-                            f"claim_error_{retry}"
-                        )
-
-                        time.sleep(2)
-
-                if success:
-
-                    logger.info(
-                        "[%s] 当前游戏处理完成。",
-                        account_name
-                    )
-
-                else:
-
-                    logger.info(
-                        "[%s] 当前候选未能确认领取。",
-                        account_name
-                    )
-
-            except Exception as e:
-
-                logger.error(
-                    "[%s] 游戏处理失败：%s",
-                    account_name,
-                    e
-                )
-
-                screenshot(
-                    page,
-                    account_name,
-                    "game_error"
-                )
-
-        logger.info(
-            "[%s] 账号处理结束。",
-            account_name
-        )
-
-        return True
-
-    except Exception as e:
-
-        logger.error(
-            "[%s] 浏览器启动/运行失败：%s",
-            account_name,
-            e
-        )
-
-        logger.error(
-            traceback.format_exc()
-        )
-
+            time.sleep(2)
         return False
+    return True
 
-    finally:
+def claim_account(account):
+    name, browser = account["name"], account["browser"]
+    exe = browser_executable(browser)
+    if not exe:
+        raise RuntimeError(f"未找到 {browser} 浏览器。")
 
-        if context:
+    profile = PROFILE_DIR/browser
+    profile.mkdir(parents=True, exist_ok=True)
+    logger.info("========== 开始：%s (%s) ==========", name, browser)
 
-            try:
-                context.close()
-            except Exception:
-                pass
+    with sync_playwright() as pw:
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            executable_path=exe,
+            headless=CONFIG.get("headless", False),
+            viewport={"width":1440,"height":900},
+            locale="zh-CN",
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(TIMEOUT)
 
+            if not ensure_login(page, name):
+                raise RuntimeError("登录超时")
 
-# ============================================================
-# 主程序
-# ============================================================
+            page.goto(EPIC_FREE_GAMES, wait_until="domcontentloaded", timeout=TIMEOUT)
+            time.sleep(4)
 
-def main():
+            if verification_needed(page):
+                screenshot(page, name, "verification")
+                messagebox.showwarning(
+                    "需要人工验证",
+                    f"{name} 检测到 CAPTCHA/安全验证。\n请完成验证后点击确定。"
+                )
 
-    logger.info(
-        "=" * 70
-    )
+            links = []
+            anchors = page.locator("a[href]")
+            for i in range(min(anchors.count(), 500)):
+                try:
+                    href = anchors.nth(i).get_attribute("href")
+                    if href and ("/p/" in href.lower() or "/game/" in href.lower()):
+                        if href.startswith("/"):
+                            href = "https://store.epicgames.com" + href
+                        if href not in links:
+                            links.append(href)
+                except Exception:
+                    pass
 
-    logger.info(
-        "Epic Auto Claim 启动"
-    )
+            if not links:
+                screenshot(page, name, "no_games")
+                raise RuntimeError("没有找到候选游戏链接")
 
-    logger.info(
-        "时间：%s",
-        datetime.now()
-    )
+            success_count = 0
+            for link in links[:6]:
+                try:
+                    page.goto(link, wait_until="domcontentloaded", timeout=TIMEOUT)
+                    time.sleep(2)
+                    if owned(page):
+                        logger.info("[%s] 已拥有，跳过：%s", name, link)
+                        continue
 
-    logger.info(
-        "=" * 70
-    )
+                    selectors = [
+                        'button:has-text("Get")','button:has-text("GET")',
+                        'button:has-text("Claim")','button:has-text("CLAIM")',
+                        'button:has-text("获取")','button:has-text("领取")',
+                        '[role="button"]:has-text("Get")',
+                        '[role="button"]:has-text("获取")',
+                        'a:has-text("Get")','a:has-text("获取")'
+                    ]
 
-    accounts = CONFIG.get(
-        "accounts",
-        []
-    )
+                    if not click_candidates(page, selectors):
+                        continue
 
+                    time.sleep(2)
+                    click_candidates(page, [
+                        'button:has-text("Place Order")',
+                        'button:has-text("Place order")',
+                        'button:has-text("Complete Purchase")',
+                        'button:has-text("确认订单")',
+                        'button:has-text("完成购买")'
+                    ])
+                    time.sleep(4)
+
+                    if owned(page) or any(x in body_text(page) for x in [
+                        "thank you", "thanks for your purchase", "谢谢"
+                    ]):
+                        success_count += 1
+                        logger.info("[%s] 领取成功：%s", name, link)
+                except Exception as e:
+                    logger.warning("[%s] 候选处理失败：%s", name, e)
+
+            logger.info("[%s] 本次完成，确认领取 %d 个。", name, success_count)
+            return success_count
+        finally:
+            context.close()
+
+def run_selected(app, accounts):
     if not accounts:
-
-        logger.error(
-            "config.json 中没有账号配置。"
-        )
-
+        app.set_status("没有启用任何账号")
         return
+    app.set_status("正在运行...")
+    for account in accounts:
+        try:
+            count = claim_account(account)
+            app.set_status(f"{account['name']} 完成，确认领取 {count} 个")
+        except Exception as e:
+            logger.error("[%s] 失败：%s", account["name"], e)
+            logger.error(traceback.format_exc())
+            app.set_status(f"{account['name']} 失败")
+    app.set_status("全部任务结束")
 
-    results = []
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Epic Auto Claim")
+        self.geometry("900x650")
+        self.minsize(820,580)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.build_ui()
+        self.refresh_from_config()
 
-    with sync_playwright() as playwright:
+    def build_ui(self):
+        style = ttk.Style(self)
+        try: style.theme_use("vista")
+        except Exception: pass
 
-        for account in accounts:
+        top = ttk.Frame(self, padding=12)
+        top.pack(fill="x")
+        ttk.Label(top, text="Epic Auto Claim", font=("Segoe UI", 20, "bold")).pack(side="left")
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(top, textvariable=self.status_var).pack(side="right")
 
-            if not account.get(
-                "enabled",
-                True
-            ):
-                continue
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=12, pady=(0,12))
 
-            try:
+        self.dashboard = ttk.Frame(nb, padding=16)
+        self.settings = ttk.Frame(nb, padding=16)
+        nb.add(self.dashboard, text="控制面板")
+        nb.add(self.settings, text="设置")
 
-                result = run_account(
-                    account,
-                    playwright
-                )
+        # Dashboard
+        self.edge_var = tk.BooleanVar()
+        self.chrome_var = tk.BooleanVar()
+        cards = ttk.LabelFrame(self.dashboard, text="账号", padding=12)
+        cards.pack(fill="x")
+        ttk.Checkbutton(cards, text="启用 Edge 账号", variable=self.edge_var).grid(row=0,column=0,padx=10,pady=8,sticky="w")
+        ttk.Checkbutton(cards, text="启用 Chrome 账号", variable=self.chrome_var).grid(row=0,column=1,padx=10,pady=8,sticky="w")
+        ttk.Label(cards,text="Edge/Chrome 使用独立 Profile，不保存 Epic 密码。").grid(row=1,column=0,columnspan=2,sticky="w",padx=10)
 
-                results.append(
-                    (
-                        account["name"],
-                        result
-                    )
-                )
+        actions = ttk.Frame(self.dashboard)
+        actions.pack(fill="x", pady=15)
+        ttk.Button(actions,text="立即领取",command=self.start_now).pack(side="left",padx=(0,8))
+        ttk.Button(actions,text="保存设置",command=self.save_config).pack(side="left",padx=8)
+        ttk.Button(actions,text="打开日志目录",command=self.open_logs).pack(side="left",padx=8)
 
-            except Exception as e:
+        sched = ttk.LabelFrame(self.dashboard,text="自动任务",padding=12)
+        sched.pack(fill="x")
+        self.schedule_enabled = tk.BooleanVar()
+        ttk.Checkbutton(sched,text="启用每周自动领取",variable=self.schedule_enabled).grid(row=0,column=0,sticky="w")
+        self.day_var = tk.StringVar()
+        self.time_var = tk.StringVar()
+        ttk.Label(sched,text="星期").grid(row=1,column=0,pady=8,sticky="w")
+        ttk.Combobox(sched,textvariable=self.day_var,values=["MON","TUE","WED","THU","FRI","SAT","SUN"],state="readonly",width=8).grid(row=1,column=1,sticky="w")
+        ttk.Label(sched,text="时间").grid(row=1,column=2,padx=(25,5),sticky="w")
+        ttk.Entry(sched,textvariable=self.time_var,width=10).grid(row=1,column=3,sticky="w")
 
-                logger.error(
-                    "%s 执行异常：%s",
-                    account["name"],
-                    e
-                )
+        logframe = ttk.LabelFrame(self.dashboard,text="运行日志",padding=8)
+        logframe.pack(fill="both",expand=True,pady=(15,0))
+        self.log_text = tk.Text(logframe,wrap="none",font=("Consolas",9))
+        self.log_text.pack(fill="both",expand=True)
 
-                results.append(
-                    (
-                        account["name"],
-                        False
-                    )
-                )
+        # Settings
+        sf = ttk.LabelFrame(self.settings,text="浏览器与运行",padding=12)
+        sf.pack(fill="x")
+        self.headless_var = tk.BooleanVar()
+        ttk.Checkbutton(sf,text="无头模式（后台运行，不显示浏览器）",variable=self.headless_var).pack(anchor="w")
+        ttk.Label(sf,text="建议首次登录和排错时关闭无头模式。").pack(anchor="w",pady=(5,0))
 
-    logger.info(
-        ""
-    )
+        pathf = ttk.LabelFrame(self.settings,text="数据目录",padding=12)
+        pathf.pack(fill="x",pady=12)
+        ttk.Label(pathf,text=str(BASE_DIR)).pack(anchor="w")
+        ttk.Label(pathf,text="profiles/：保存两个独立登录状态；logs/：日志；screenshots/：异常截图。").pack(anchor="w",pady=(5,0))
 
-    logger.info(
-        "=" * 70
-    )
+        ttk.Button(self.settings,text="保存设置",command=self.save_config).pack(anchor="e")
 
-    logger.info(
-        "本次执行结果"
-    )
+    def refresh_from_config(self):
+        cfg = load_config()
+        self.edge_var.set(cfg["accounts"][0].get("enabled",True))
+        self.chrome_var.set(cfg["accounts"][1].get("enabled",True))
+        self.schedule_enabled.set(cfg.get("schedule",{}).get("enabled",True))
+        self.day_var.set(cfg.get("schedule",{}).get("day","THU"))
+        self.time_var.set(cfg.get("schedule",{}).get("time","18:00"))
+        self.headless_var.set(cfg.get("headless",False))
 
-    logger.info(
-        "=" * 70
-    )
+    def save_config(self):
+        cfg = load_config()
+        cfg["accounts"][0]["enabled"] = self.edge_var.get()
+        cfg["accounts"][1]["enabled"] = self.chrome_var.get()
+        cfg["schedule"] = {
+            "enabled": self.schedule_enabled.get(),
+            "day": self.day_var.get(),
+            "time": self.time_var.get()
+        }
+        cfg["headless"] = self.headless_var.get()
+        CONFIG_FILE.write_text(json.dumps(cfg,ensure_ascii=False,indent=4),encoding="utf-8")
+        logger.info("设置已保存。")
+        messagebox.showinfo("设置","设置已保存。")
 
-    for name, result in results:
+    def selected_accounts(self):
+        accounts = []
+        if self.edge_var.get():
+            accounts.append({"name":"Edge账号","browser":"edge","enabled":True})
+        if self.chrome_var.get():
+            accounts.append({"name":"Chrome账号","browser":"chrome","enabled":True})
+        return accounts
 
-        logger.info(
-            "%s : %s",
-            name,
-            "完成" if result else "失败"
-        )
+    def start_now(self):
+        self.save_config()
+        accounts = self.selected_accounts()
+        threading.Thread(target=run_selected,args=(self,accounts),daemon=True).start()
 
-    logger.info(
-        "Epic Auto Claim 结束"
-    )
+    def set_status(self,text):
+        self.after(0, lambda:self.status_var.set(text))
 
+    def append_log(self,text):
+        self.log_text.insert("end",text+"\n")
+        self.log_text.see("end")
+
+    def open_logs(self):
+        os.startfile(str(LOG_DIR))
 
 if __name__ == "__main__":
-
-    try:
-        main()
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "用户终止程序。"
-        )
-
-    except Exception:
-
-        logger.error(
-            traceback.format_exc()
-        )
-
-    finally:
-
-        print()
-        print(
-            "程序执行结束。"
-        )
-        print(
-            f"日志：{log_file}"
-        )
+    handler = None
+    app = App()
+    handler = GuiLogHandler(app)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    app.mainloop()

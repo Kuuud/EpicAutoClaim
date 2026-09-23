@@ -1,6 +1,5 @@
 {
     "headless": false,
-
     "accounts": [
         {
             "name": "Edge账号",
@@ -13,7 +12,11 @@
             "enabled": true
         }
     ],
-
+    "schedule": {
+        "enabled": true,
+        "day": "THU",
+        "time": "18:00"
+    },
     "claim": {
         "timeout": 30000,
         "retry": 3,
